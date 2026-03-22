@@ -9,7 +9,7 @@ from datetime import timedelta
 load_dotenv()
 
 MONGO_URI = os.getenv("MONGO_URI")
-client    = MongoClient(MONGO_URI)
+client = MongoClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
 db        = client["aistudydb"]
 users     = db["users"]
 
