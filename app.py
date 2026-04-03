@@ -14,6 +14,10 @@ from flask_jwt_extended import JWTManager
 from routes.auth import auth_bp
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from routes.assignmentmaker import write_assignment
+from routes.Letter import generate_letter,DOC_LABELS
+import traceback
+from routes.Iq import generate_questions, evaluate_answers
 
 import os
 import tempfile
@@ -410,9 +414,264 @@ def flashcard_generator_file():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/assignment", methods=["POST"])
+def generate_assignment():
+    """
+    POST /api/assignment
+    Body (JSON):
+    {
+        "topic"        : "The Impact of Climate Change on Agriculture",
+        "pages"        : 3,
+        "subject"      : "Environmental Science",
+        "student_name" : "Ali Hassan",
+        "roll_no"      : "CS-2024-045",
+        "professor"    : "Dr. Ahmed Khan",
+        "humanize"     : true
+    }
+ 
+    Response (JSON):
+    {
+        "success" : true,
+        "content" : "<full assignment body text>"
+    }
+    """
+    try:
+        data = request.get_json()
+ 
+        if not data:
+            return jsonify({"success": False, "error": "No JSON body provided."}), 400
+ 
+        # ── Required field ───────────────────────────────────────────────────
+        topic = data.get("topic", "").strip()
+        if not topic:
+            return jsonify({"success": False, "error": "Assignment topic is required."}), 400
+ 
+        # ── Optional fields with sensible defaults ───────────────────────────
+        pages        = int(data.get("pages", 3))
+        subject      = data.get("subject", topic).strip()
+        student_name = data.get("student_name", "Student Name").strip()
+        roll_no      = data.get("roll_no", "N/A").strip()
+        professor    = data.get("professor", "Professor").strip()
+        humanize     = bool(data.get("humanize", True))
+ 
+        # ── Validate pages range ─────────────────────────────────────────────
+        if pages < 1 or pages > 10:
+            return jsonify({"success": False, "error": "Pages must be between 1 and 10."}), 400
+ 
+        # ── Generate ─────────────────────────────────────────────────────────
+        content = write_assignment(
+            topic        = topic,
+            pages        = pages,
+            subject      = subject,
+            student_name = student_name,
+            roll_no      = roll_no,
+            professor    = professor,
+            humanize     = humanize,
+        )
+ 
+        if content.startswith("Error generating assignment:"):
+            return jsonify({"success": False, "error": content}), 500
+ 
+        return jsonify({"success": True, "content": content})
+ 
+    except ValueError as ve:
+        return jsonify({"success": False, "error": f"Invalid input: {str(ve)}"}), 400
+    except Exception as e:
+        print(f"[/api/assignment] Unexpected error: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred."}), 500
+ 
 
+ 
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "IQ Test API"})
+ 
+ 
+# ── Generate questions ─────────────────────────────────────────────────────
+@app.route("/api/iq/generate", methods=["POST"])
+def api_generate():
+    """
+    POST /api/iq/generate
+    Body: { name, age, education, subject?, grade?, count? }
+    Returns: { success, questions, time_per_question }
+    """
+    try:
+        body = request.get_json(force=True)
+ 
+        name      = str(body.get("name",      "")).strip()
+        age       = int(body.get("age",        0))
+        education = str(body.get("education", "")).strip()
+        subject   = str(body.get("subject",   "")).strip()
+        grade     = str(body.get("grade",     "")).strip()
+        count     = int(body.get("count",      15))
+ 
+        # Validation
+        if not name:
+            return jsonify({"success": False, "error": "Name is required"}), 400
+        if age < 5 or age > 100:
+            return jsonify({"success": False, "error": "Invalid age (must be 5–100)"}), 400
+        if not education:
+            return jsonify({"success": False, "error": "Education level is required"}), 400
+        if count < 5 or count > 30:
+            return jsonify({"success": False, "error": "Count must be between 5 and 30"}), 400
+ 
+        questions, time_per_q = generate_questions(
+            name=name, age=age, education=education,
+            subject=subject, grade=grade, count=count,
+        )
+ 
+        return jsonify({
+            "success":           True,
+            "questions":         questions,
+            "time_per_question": time_per_q,
+        })
+ 
+    except json.JSONDecodeError as e:
+        return jsonify({"success": False, "error": f"AI returned invalid JSON: {str(e)}"}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+ 
+ 
+# ── Evaluate answers ───────────────────────────────────────────────────────
+@app.route("/api/iq/evaluate", methods=["POST"])
+def api_evaluate():
+    """
+    POST /api/iq/evaluate
+    Body: { name, age, education, subject?, grade?, questions, answers, timed_out, time_taken }
+    Returns: { success, result: { iq_score, percentile, correct, accuracy, time_taken,
+                                  breakdown, analysis, strengths, improvements } }
+    """
+    try:
+        body = request.get_json(force=True)
+ 
+        name       = str(body.get("name",      "")).strip()
+        age        = int(body.get("age",        0))
+        education  = str(body.get("education", "")).strip()
+        subject    = str(body.get("subject",   "")).strip()
+        grade      = str(body.get("grade",     "")).strip()
+        questions  = body.get("questions",  [])
+        answers    = body.get("answers",    {})
+        timed_out  = bool(body.get("timed_out",  False))
+        time_taken = int(body.get("time_taken",  0))
+ 
+        if not questions:
+            return jsonify({"success": False, "error": "No questions provided"}), 400
+ 
+        result = evaluate_answers(
+            name=name, age=age, education=education,
+            subject=subject, grade=grade,
+            questions=questions, answers=answers,
+            timed_out=timed_out, time_taken=time_taken,
+        )
+ 
+        return jsonify({"success": True, "result": result})
+ 
+    except json.JSONDecodeError as e:
+        return jsonify({"success": False, "error": f"AI returned invalid JSON: {str(e)}"}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+    
+
+ 
+ 
+# ── List all supported document types ─────────────────────────────────────
+@app.route("/api/letter/types", methods=["GET"])
+def api_letter_types():
+    """
+    GET /api/letter/types
+    Returns all supported doc type IDs and their friendly labels.
+    """
+    types = [{"id": k, "label": v} for k, v in DOC_LABELS.items()]
+    return jsonify({"success": True, "types": types})
+ 
+ 
+# ── Generate letter / application / email / report ─────────────────────────
+@app.route("/api/letter/generate", methods=["POST"])
+def api_letter_generate():
+    """
+    POST /api/letter/generate
+ 
+    Body:
+    {
+        "doc_type"         : "leave_application",     // required
+        "tone"             : "formal",                // formal|polite|humble|confident|urgent
+        "subject"          : "3-day sick leave ...",  // required
+        "sender_name"      : "Ali Hassan",            // optional
+        "sender_title"     : "BS-CS 3rd Year",        // optional
+        "sender_org"       : "Karachi University",    // optional
+        "sender_addr"      : "Block 5, Gulshan",      // optional
+        "recipient_name"   : "The Principal",         // optional
+        "recipient_title"  : "Principal",             // optional
+        "recipient_org"    : "Govt College Karachi",  // optional
+        "recipient_addr"   : "Nazimabad, Karachi",    // optional
+        "extra_details"    : "Absent Jan 10-12 ..."   // optional
+    }
+ 
+    Returns:
+    {
+        "success" : true,
+        "content" : "Dear Sir / Madam, ..."
+    }
+    """
+    try:
+        body = request.get_json(force=True)
+ 
+        doc_type        = str(body.get("doc_type",         "")).strip()
+        tone            = str(body.get("tone",        "formal")).strip().lower()
+        subject         = str(body.get("subject",          "")).strip()
+        sender_name     = str(body.get("sender_name",      "")).strip()
+        sender_title    = str(body.get("sender_title",     "")).strip()
+        sender_org      = str(body.get("sender_org",       "")).strip()
+        sender_addr     = str(body.get("sender_addr",      "")).strip()
+        recipient_name  = str(body.get("recipient_name",   "")).strip()
+        recipient_title = str(body.get("recipient_title",  "")).strip()
+        recipient_org   = str(body.get("recipient_org",    "")).strip()
+        recipient_addr  = str(body.get("recipient_addr",   "")).strip()
+        extra_details   = str(body.get("extra_details",    "")).strip()
+ 
+        # ── Validation ─────────────────────────────────────────────────────
+        if not doc_type:
+            return jsonify({"success": False, "error": "doc_type is required"}), 400
+ 
+        if doc_type not in DOC_LABELS:
+            return jsonify({
+                "success": False,
+                "error": f"Unknown doc_type '{doc_type}'. Call GET /api/letter/types for valid options.",
+            }), 400
+ 
+        if not subject:
+            return jsonify({"success": False, "error": "subject is required"}), 400
+ 
+        # Silently fall back to formal if an invalid tone is sent
+        valid_tones = {"formal", "polite", "humble", "confident", "urgent"}
+        if tone not in valid_tones:
+            tone = "formal"
+ 
+        # ── Generate ───────────────────────────────────────────────────────
+        content = generate_letter(
+            doc_type=doc_type,
+            tone=tone,
+            subject=subject,
+            sender_name=sender_name,
+            sender_title=sender_title,
+            sender_org=sender_org,
+            sender_addr=sender_addr,
+            recipient_name=recipient_name,
+            recipient_title=recipient_title,
+            recipient_org=recipient_org,
+            recipient_addr=recipient_addr,
+            extra_details=extra_details,
+        )
+ 
+        return jsonify({"success": True, "content": content})
+ 
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+ 
+ 
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(debug=True, port=5000)
