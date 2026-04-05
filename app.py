@@ -31,26 +31,26 @@ import openpyxl
 app = Flask(__name__)
 CORS(app)
 
-# ✅ JWT
+# ✅ 1. JWT first
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET", "aistudysecretkey123")
 jwt = JWTManager(app)
 
-# ✅ Register blueprint
+# ✅ 2. Register blueprint second
 app.register_blueprint(auth_bp, url_prefix="/auth")
 
-# ✅ GLOBAL RATE LIMITER — 20 requests per day across ALL AI tools
+# ✅ 3. Limiter third
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=[],          # no default — we control manually
+    default_limits=["200 per day", "50 per hour"],
     storage_uri="memory://"
 )
 
-# Auth routes — separate limits
+# ✅ 4. Apply auth limits
 limiter.limit("5 per hour")(app.view_functions["auth_routes.register"])
 limiter.limit("10 per hour")(app.view_functions["auth_routes.login"])
 
-# ✅ Global AI limit — 20 requests per day per IP
+# ✅ 5. Global AI limit — 20 requests per day per IP
 AI_LIMIT = "20 per day"
 
 # ── Folders ──────────────────────────────────────────────────
@@ -85,7 +85,10 @@ def extract_text_from_pdf(file_path):
         reader = PyPDF2.PdfReader(f)
         for idx, page in enumerate(reader.pages):
             text = page.extract_text()
-            slides_text.append({"slide_number": idx + 1, "text": text.strip() if text else ""})
+            slides_text.append({
+                "slide_number": idx + 1,
+                "text": text.strip() if text else ""
+            })
     return slides_text
 
 def extract_doc_text(file_path, filename):
@@ -122,12 +125,7 @@ def extract_doc_text(file_path, filename):
             text = f.read()
     return text
 
-# ── Helper: return remaining requests in response ────────────
-def add_rate_headers(response):
-    """Adds X-RateLimit-Remaining header so frontend can show it."""
-    return response
-
-# ── AI Tool Routes (ALL use AI_LIMIT) ───────────────────────
+# ── Routes ───────────────────────────────────────────────────
 
 @app.route("/solve-assignment", methods=["POST"])
 @limiter.limit(AI_LIMIT)
@@ -205,7 +203,7 @@ def generate_quiz_route():
             return jsonify({"error": "No text provided"}), 400
         quiz = generate_quiz(text, num_question)
         if not quiz:
-            return jsonify({"error": "Could not generate quiz."}), 400
+            return jsonify({"error": "Could not generate quiz. Try a different topic."}), 400
         return jsonify({"quiz": quiz})
     except Exception as e:
         print("SERVER ERROR (Generate Quiz):", e)
@@ -339,7 +337,7 @@ def flashcard_generator():
             return jsonify({"error": "No text provided"}), 400
         cards = generate_flashcards(text, card_count, subject)
         if not cards:
-            return jsonify({"error": "Could not generate flashcards."}), 400
+            return jsonify({"error": "Could not generate flashcards. Try with more content."}), 400
         return jsonify({"flashcards": cards})
     except Exception as e:
         print("Flashcard Error:", e)
@@ -386,9 +384,13 @@ def generate_assignment():
         if pages < 1 or pages > 10:
             return jsonify({"success": False, "error": "Pages must be between 1 and 10."}), 400
         content = write_assignment(
-            topic=topic, pages=pages, subject=subject,
-            student_name=student_name, roll_no=roll_no,
-            professor=professor, humanize=humanize,
+            topic        = topic,
+            pages        = pages,
+            subject      = subject,
+            student_name = student_name,
+            roll_no      = roll_no,
+            professor    = professor,
+            humanize     = humanize,
         )
         if content.startswith("Error generating assignment:"):
             return jsonify({"success": False, "error": content}), 500
@@ -428,7 +430,11 @@ def api_generate():
             name=name, age=age, education=education,
             subject=subject, grade=grade, count=count,
         )
-        return jsonify({"success": True, "questions": questions, "time_per_question": time_per_q})
+        return jsonify({
+            "success":           True,
+            "questions":         questions,
+            "time_per_question": time_per_q,
+        })
     except json.JSONDecodeError as e:
         return jsonify({"success": False, "error": f"AI returned invalid JSON: {str(e)}"}), 500
     except Exception as e:
@@ -492,19 +498,28 @@ def api_letter_generate():
         if not doc_type:
             return jsonify({"success": False, "error": "doc_type is required"}), 400
         if doc_type not in DOC_LABELS:
-            return jsonify({"success": False, "error": f"Unknown doc_type '{doc_type}'."}), 400
+            return jsonify({
+                "success": False,
+                "error": f"Unknown doc_type '{doc_type}'. Call GET /api/letter/types for valid options.",
+            }), 400
         if not subject:
             return jsonify({"success": False, "error": "subject is required"}), 400
         valid_tones = {"formal", "polite", "humble", "confident", "urgent"}
         if tone not in valid_tones:
             tone = "formal"
         content = generate_letter(
-            doc_type=doc_type, tone=tone, subject=subject,
-            sender_name=sender_name, sender_title=sender_title,
-            sender_org=sender_org, sender_addr=sender_addr,
-            recipient_name=recipient_name, recipient_title=recipient_title,
-            recipient_org=recipient_org, recipient_addr=recipient_addr,
-            extra_details=extra_details,
+            doc_type        = doc_type,
+            tone            = tone,
+            subject         = subject,
+            sender_name     = sender_name,
+            sender_title    = sender_title,
+            sender_org      = sender_org,
+            sender_addr     = sender_addr,
+            recipient_name  = recipient_name,
+            recipient_title = recipient_title,
+            recipient_org   = recipient_org,
+            recipient_addr  = recipient_addr,
+            extra_details   = extra_details,
         )
         return jsonify({"success": True, "content": content})
     except Exception as e:
@@ -517,7 +532,7 @@ def api_letter_generate():
 def rate_limit_exceeded(e):
     return jsonify({
         "error": "Daily limit reached",
-        "message": "You have used all 20 free requests for today. Please come back tomorrow!",
+        "message": "You have used all 20 free requests for today. Come back tomorrow!",
         "retry_after": "24 hours"
     }), 429
 
