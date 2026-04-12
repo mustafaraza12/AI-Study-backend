@@ -48,3 +48,5 @@ typing-inspection==0.4.2
 lxml==6.0.2
 pillow==12.1.1
 fpdf2==2.8.7
+Flask-SQLAlchemy==3.1.1
+psycopg2-binary==2.9.9
