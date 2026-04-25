@@ -2,11 +2,11 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from routes.assignment import solve_assignment
-from routes.summarize import summarize_text
+from routes.summarize import extract_text, summarize_text
 from routes.quiz import generate_quiz
 from routes.code_helper import explain_code
 from routes.slide import explain_slide_text
-from routes.youtube import explain_youtube
+from routes.youtube import fetch_transcript_only, analyze_youtube
 from routes.humanize import humanize_text
 from routes.math import solve_math, solve_math_image
 from routes.essay import write_essay
@@ -19,6 +19,7 @@ from routes.assignmentmaker import write_assignment
 from routes.Letter import generate_letter,DOC_LABELS
 import traceback
 from routes.Iq import generate_questions, evaluate_answers
+import logging
 
 import os
 import tempfile
@@ -178,81 +179,157 @@ def summarize_pdf():
         return jsonify({"error": "Server error"}), 500
 
 
-# New document summarizer — handles PDF, Word, PPT, Excel, TXT
 @app.route("/summarize-document", methods=["POST"])
 @limiter.limit("15 per hour")
 def summarize_document():
     try:
+        # ── 1. Validate file ────────────────────────────────────────────
         if "file" not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
-
+ 
         file = request.files["file"]
-        if file.filename == "":
+        if not file.filename:
             return jsonify({"error": "No file selected"}), 400
-
+ 
         if not allowed_doc_file(file.filename):
             return jsonify({"error": "Unsupported file type"}), 400
-
-        # Save to temp file with correct extension
+ 
+        # ── 2. Read mode + optional chat question from form data ────────
+        mode     = request.form.get("mode", "summary").strip().lower()
+        question = request.form.get("question", "").strip()   # only used in chat mode
+        context  = request.form.get("context", "").strip()    # optional cached summary
+ 
+        VALID_MODES = {"summary", "keypoints", "flashcards", "quiz", "chat"}
+        if mode not in VALID_MODES:
+            mode = "summary"
+ 
+        # Chat mode requires a question
+        if mode == "chat" and not question:
+            return jsonify({"error": "Please enter a question to ask about your document."}), 400
+ 
+        # ── 3. Save to temp file ────────────────────────────────────────
         ext = file.filename.rsplit(".", 1)[1].lower()
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
             file.save(tmp.name)
             tmp_path = tmp.name
-
+ 
         try:
-            text = extract_doc_text(tmp_path, file.filename)
-
+            # ── 4. Extract text ─────────────────────────────────────────
+            text = extract_text(tmp_path, file.filename)
+ 
             if not text.strip():
                 return jsonify({"error": "Could not extract text from this document."}), 422
-
-            # Cap at 6000 chars to stay within token limits
-            summary = summarize_text(text[:6000])
-            return jsonify({"summary": summary})
-
+ 
+            # ── 5. For chat: prepend cached summary as extra context ────
+            # This means the user doesn't need to re-upload the whole file
+            # for every follow-up question.
+            if mode == "chat" and context:
+                text = f"[Document Summary for context]\n{context}\n\n[Full Document Text]\n{text}"
+ 
+            # ── 6. Generate output ──────────────────────────────────────
+            result = summarize_text(
+                text=text,
+                mode=mode,
+                question=question,
+                max_tokens=1400,
+            )
+ 
+            return jsonify({"summary": result})
+ 
         finally:
+            # Always clean up the temp file
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-
+ 
     except Exception as e:
-        print("SERVER ERROR (Summarize Document):", e)
-        return jsonify({"error": "Server error"}), 500
+        print("SERVER ERROR (summarize_document):", e)
+        return jsonify({"error": "Server error. Please try again."}), 500
 
 
+ 
 @app.route("/generate-quiz", methods=["POST"])
 @limiter.limit("15 per hour")
 def generate_quiz_route():
     try:
-        data         = request.json
-        text         = data.get("text")
-        num_question = data.get("num_question", 20)
-
+        data = request.json
+ 
+        text         = data.get("text", "").strip()
+        num_question = int(data.get("num_question", 10))
+        difficulty   = data.get("difficulty", "medium").strip().lower()
+        quiz_type    = data.get("quiz_type", "mcq").strip().lower()
+ 
+        # ── Validate inputs ──────────────────────────────────────────────────
         if not text:
-            return jsonify({"error": "No text provided"}), 400
-
-        quiz = generate_quiz(text, num_question)
-
+            return jsonify({"error": "No topic provided"}), 400
+ 
+        if num_question < 1 or num_question > 50:
+            return jsonify({"error": "num_question must be between 1 and 50"}), 400
+ 
+        if difficulty not in ("easy", "medium", "hard"):
+            difficulty = "medium"
+ 
+        if quiz_type not in ("mcq", "truefalse", "mixed"):
+            quiz_type = "mcq"
+ 
+        # ── Generate ─────────────────────────────────────────────────────────
+        quiz = generate_quiz(
+            text=text,
+            num_question=num_question,
+            difficulty=difficulty,
+            quiz_type=quiz_type,
+        )
+ 
         if not quiz:
             return jsonify({"error": "Could not generate quiz. Try a different topic."}), 400
-
+ 
         return jsonify({"quiz": quiz})
-
+ 
     except Exception as e:
-        print("SERVER ERROR (Generate Quiz):", e)
+        print("SERVER ERROR (generate_quiz_route):", e)
         return jsonify({"error": "Server error"}), 500
 
 
+VALID_EXPLAIN_MODES = {"beginner", "detailed", "summary", "linebyline"}
+ 
+SUPPORTED_LANGUAGES = {
+    "python", "javascript", "typescript", "java", "c", "c++", "c#",
+    "go", "rust", "php", "ruby", "swift", "kotlin", "sql",
+    "html/css", "bash", "dart", "r", "matlab",
+}
+ 
+ 
 @app.route("/explain-code", methods=["POST"])
-@limiter.limit("15 per hour")
-def code_explainer():
+@limiter.limit("20 per hour")
+def explain_code_route():
     data = request.json
-    code = data.get("code")
-    language = data.get("language", "Python")
-
+ 
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+ 
+    code = data.get("code", "").strip()
+    language = data.get("language", None)
+    mode = data.get("mode", "detailed").strip().lower()
+ 
     if not code:
-        return jsonify({"explanation": "No code provided!"})
-
-    explanation = explain_code(code, language)
-    return jsonify({"explanation": explanation})
+        return jsonify({"error": "No code provided"}), 400
+ 
+    if len(code) > 8000:
+        return jsonify({"error": "Code too long. Please limit to 8000 characters."}), 400
+ 
+    # Validate language
+    if language and language.lower() not in SUPPORTED_LANGUAGES:
+        language = None  # fallback to auto-detect
+ 
+    # Validate mode
+    if mode not in VALID_EXPLAIN_MODES:
+        mode = "detailed"
+ 
+    result = explain_code(code, language=language, mode=mode)
+ 
+    if result == "Error explaining code":
+        return jsonify({"error": "Failed to explain code. Please try again."}), 500
+ 
+    return jsonify({"explanation": result})
 
 
 @app.route("/explain-slide", methods=["POST"])
@@ -290,62 +367,159 @@ def slide_explainer():
     return jsonify({"explanation": combined_explanation})
 
 
+VALID_MODES = {"standard", "fluency", "formal", "simple", "creative"}
+ 
 @app.route("/humanize-text", methods=["POST"])
 @limiter.limit("20 per hour")
 def humanize():
     data = request.json
-    text = data.get("text")
-
+ 
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+ 
+    text = data.get("text", "").strip()
+    mode = data.get("mode", "standard").strip().lower()
+ 
     if not text:
         return jsonify({"error": "No text provided"}), 400
-
-    result = humanize_text(text)
+ 
+    if len(text) > 5000:
+        return jsonify({"error": "Text too long. Please limit to 5000 characters."}), 400
+ 
+    if mode not in VALID_MODES:
+        mode = "standard"
+ 
+    result = humanize_text(text, mode)
+ 
+    if result == "Error humanizing text":
+        return jsonify({"error": "Failed to humanize text. Please try again."}), 500
+ 
     return jsonify({"humanized": result})
-
-
-@app.route("/explain-youtube", methods=["POST"])
-@limiter.limit("10 per hour")
-def youtube_explainer():
+ 
+@app.route("/youtube-transcript", methods=["POST"])
+@limiter.limit("30 per hour")
+def youtube_transcript():
     try:
         data = request.json
-        url = data.get("url")
-
+        url  = data.get("url", "").strip()
         if not url:
-            return jsonify({"error": "No YouTube URL provided"}), 400
+            return jsonify({"error": "No URL provided"}), 400
 
-        explanation = explain_youtube(url)
-        return jsonify({"explanation": explanation})
+        result = fetch_transcript_only(url)
+        if "error" in result:
+            return jsonify(result), 400
+        return jsonify(result)
 
     except Exception as e:
-        print("SERVER ERROR (YouTube Explainer):", e)
+        logging.exception("Transcript endpoint error:")
         return jsonify({"error": "Server error"}), 500
-    
+
+
+# Slow route — LLM analysis, returns in 8-15s
+@app.route("/analyze-youtube", methods=["POST"])
+@limiter.limit("10 per hour")
+def youtube_analyze():
+    try:
+        data = request.json
+        url  = data.get("url", "").strip()
+        if not url:
+            return jsonify({"error": "No URL provided"}), 400
+
+        result = analyze_youtube(url)
+        if "error" in result:
+            return jsonify(result), 400
+        return jsonify(result)
+
+    except Exception as e:
+        logging.exception("Analyze endpoint error:")
+        return jsonify({"error": "Server error"}), 500
 
 
 @app.route("/solve-math", methods=["POST"])
 @limiter.limit("20 per hour")
 def math_solver():
+    """
+    Accepts EITHER:
+      A) JSON body  { "problem": "2x + 5 = 11" }
+      B) multipart form with:
+           - optional "image" file  → OCR'd to text
+           - optional "problem" text field
+         If both are provided, the extracted OCR text is APPENDED to the
+         typed problem so the AI sees everything at once.
+    """
     try:
-        data = request.json
-        problem = data.get("problem")
-        if not problem:
-            return jsonify({"error": "No problem provided"}), 400
-        solution = solve_math(problem)
-        return jsonify({"solution": solution})
+        problem_text = ""
+        extracted_ocr = ""
+ 
+        content_type = request.content_type or ""
+ 
+        # ── A: plain JSON ────────────────────────────────────────────────
+        if "application/json" in content_type:
+            data = request.get_json(force=True) or {}
+            problem_text = str(data.get("problem", "")).strip()
+ 
+        # ── B: multipart form (image + optional text) ────────────────────
+        else:
+            problem_text = str(request.form.get("problem", "")).strip()
+ 
+            if "image" in request.files:
+                img_file = request.files["image"]
+                if img_file and img_file.filename:
+                    from routes.math import extract_text_from_image
+                    img_file.seek(0)
+                    extracted_ocr = extract_text_from_image(img_file).strip()
+ 
+        # ── Combine typed text + OCR text ────────────────────────────────
+        combined = ""
+        if problem_text and extracted_ocr:
+            combined = f"{problem_text}\n\nProblems from image:\n{extracted_ocr}"
+        elif problem_text:
+            combined = problem_text
+        elif extracted_ocr:
+            combined = extracted_ocr
+ 
+        if not combined:
+            return jsonify({
+                "error": "Please provide a math problem as text or upload an image."
+            }), 400
+ 
+        result = solve_math(combined)
+ 
+        if result["success"]:
+            response_body = {"data": result["data"]}
+            if extracted_ocr:
+                response_body["extracted_text"] = extracted_ocr   # show user what was read
+            return jsonify(response_body)
+        else:
+            return jsonify({"error": result.get("error", "Unknown error")}), 500
+ 
     except Exception as e:
         print("Math Solver Error:", e)
         return jsonify({"error": "Server error"}), 500
-
-
+ 
+ 
 @app.route("/solve-math-image", methods=["POST"])
 @limiter.limit("20 per hour")
 def math_solver_image():
+    """
+    Legacy image-only endpoint — kept for backward compatibility.
+    Prefer /solve-math with a multipart form now.
+    """
     try:
         if "image" not in request.files:
             return jsonify({"error": "No image provided"}), 400
+ 
         file = request.files["image"]
-        solution = solve_math_image(file)
-        return jsonify({"solution": solution})
+        result = solve_math_image(file)
+ 
+        if result["success"]:
+            return jsonify({
+                "data": result["data"],
+                "extracted_text": result.get("extracted_text", ""),
+            })
+        else:
+            return jsonify({"error": result.get("error", "Unknown error")}), 500
+ 
     except Exception as e:
         print("Math Image Solver Error:", e)
         return jsonify({"error": "Server error"}), 500
@@ -585,45 +759,9 @@ def api_evaluate():
 
  
  
-# ── List all supported document types ─────────────────────────────────────
-@app.route("/api/letter/types", methods=["GET"])
-def api_letter_types():
-    """
-    GET /api/letter/types
-    Returns all supported doc type IDs and their friendly labels.
-    """
-    types = [{"id": k, "label": v} for k, v in DOC_LABELS.items()]
-    return jsonify({"success": True, "types": types})
- 
- 
-# ── Generate letter / application / email / report ─────────────────────────
-@app.route("/api/letter/generate", methods=["POST"])
-def api_letter_generate():
-    """
-    POST /api/letter/generate
- 
-    Body:
-    {
-        "doc_type"         : "leave_application",     // required
-        "tone"             : "formal",                // formal|polite|humble|confident|urgent
-        "subject"          : "3-day sick leave ...",  // required
-        "sender_name"      : "Ali Hassan",            // optional
-        "sender_title"     : "BS-CS 3rd Year",        // optional
-        "sender_org"       : "Karachi University",    // optional
-        "sender_addr"      : "Block 5, Gulshan",      // optional
-        "recipient_name"   : "The Principal",         // optional
-        "recipient_title"  : "Principal",             // optional
-        "recipient_org"    : "Govt College Karachi",  // optional
-        "recipient_addr"   : "Nazimabad, Karachi",    // optional
-        "extra_details"    : "Absent Jan 10-12 ..."   // optional
-    }
- 
-    Returns:
-    {
-        "success" : true,
-        "content" : "Dear Sir / Madam, ..."
-    }
-    """
+@app.route("/api/letter", methods=["POST"])
+@limiter.limit("15 per hour")
+def api_letter():
     try:
         body = request.get_json(force=True)
  
@@ -631,14 +769,12 @@ def api_letter_generate():
         tone            = str(body.get("tone",        "formal")).strip().lower()
         subject         = str(body.get("subject",          "")).strip()
         sender_name     = str(body.get("sender_name",      "")).strip()
-        sender_title    = str(body.get("sender_title",     "")).strip()
-        sender_org      = str(body.get("sender_org",       "")).strip()
-        sender_addr     = str(body.get("sender_addr",      "")).strip()
-        recipient_name  = str(body.get("recipient_name",   "")).strip()
+        sender_class    = str(body.get("sender_class",     "")).strip()   # ✅ was missing
         recipient_title = str(body.get("recipient_title",  "")).strip()
         recipient_org   = str(body.get("recipient_org",    "")).strip()
         recipient_addr  = str(body.get("recipient_addr",   "")).strip()
         extra_details   = str(body.get("extra_details",    "")).strip()
+        date            = str(body.get("date",             "")).strip()   # ✅ was missing
  
         # ── Validation ─────────────────────────────────────────────────────
         if not doc_type:
@@ -647,14 +783,16 @@ def api_letter_generate():
         if doc_type not in DOC_LABELS:
             return jsonify({
                 "success": False,
-                "error": f"Unknown doc_type '{doc_type}'. Call GET /api/letter/types for valid options.",
+                "error": f"Unknown doc_type '{doc_type}'.",
             }), 400
  
         if not subject:
             return jsonify({"success": False, "error": "subject is required"}), 400
  
-        # Silently fall back to formal if an invalid tone is sent
-        valid_tones = {"formal", "polite", "humble", "confident", "urgent"}
+        if not recipient_title:
+            return jsonify({"success": False, "error": "recipient_title is required"}), 400
+ 
+        valid_tones = {"formal", "polite", "humble", "urgent"}
         if tone not in valid_tones:
             tone = "formal"
  
@@ -664,27 +802,27 @@ def api_letter_generate():
             tone=tone,
             subject=subject,
             sender_name=sender_name,
-            sender_title=sender_title,
-            sender_org=sender_org,
-            sender_addr=sender_addr,
-            recipient_name=recipient_name,
+            sender_class=sender_class,       # ✅ correct param name
             recipient_title=recipient_title,
             recipient_org=recipient_org,
             recipient_addr=recipient_addr,
             extra_details=extra_details,
+            date=date,                       # ✅ correct param name
         )
  
         return jsonify({"success": True, "content": content})
  
     except Exception as e:
+        import traceback
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
+ 
 
 db = SQLAlchemy(app)
     
 
 class Post(db.Model):
-    __tablename__ = 'posts' # Tells Flask to look for the 'posts' table
+    __tablename__ = 'Studify' # Tells Flask to look for the 'posts' table
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(255), nullable=False)
     slug = db.Column(db.String(255), unique=True, nullable=False)
