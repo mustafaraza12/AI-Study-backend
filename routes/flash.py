@@ -1,5 +1,3 @@
-# routes/flashcard.py
-
 from openai import OpenAI
 import os
 import json
@@ -97,4 +95,5 @@ Return ONLY the JSON array:
                 "answer":   str(card["answer"]).strip(),
             })
 
+    return validated
     return validated
