@@ -261,5 +261,4 @@ Transcript:
 
     except Exception as e:
         print(f"[Analyze] LLM error: {type(e).__name__}: {e}")
-        return {"error": f"AI analysis failed: {str(e)}"}: {type(e).__name__}: {e}")
-        return f"AI summarization failed: {str(e)}"
+        return {"error": f"AI analysis failed: {str(e)}"}
