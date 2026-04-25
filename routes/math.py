@@ -188,5 +188,4 @@ def solve_math_image(file) -> dict:
     if result.get("success"):
         result["extracted_text"] = extracted
 
-    return result Image Solver Error: {e}")
-        return f"Error solving image problem: {str(e)}"
+    return result
