@@ -1,14 +1,11 @@
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-
 load_dotenv()
-
 client = OpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1"
 )
-
 MODE_PROMPTS = {
     "standard": (
         "Rewrite the following AI-generated text to sound natural, human, and conversational. "
@@ -41,14 +38,11 @@ MODE_PROMPTS = {
         "Do not add commentary — return only the rewritten text."
     ),
 }
-
 DEFAULT_MODE = "standard"
-
 
 def humanize_text(text: str, mode: str = DEFAULT_MODE) -> str:
     try:
         system_prompt = MODE_PROMPTS.get(mode, MODE_PROMPTS[DEFAULT_MODE])
-
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -61,12 +55,10 @@ def humanize_text(text: str, mode: str = DEFAULT_MODE) -> str:
                     "content": text
                 }
             ],
-            temperature=0.85,       # slightly higher for more natural variation
+            temperature=0.85,
             max_tokens=2048,
         )
-
         return response.choices[0].message.content.strip()
-
     except Exception as e:
-        print(f"Humanizer Error [{mode}]:", e)
-        return "Error humanizing text"", e)
+        print(f"Humanizer Error [{mode}]: {e}")
+        return "Error humanizing text"
