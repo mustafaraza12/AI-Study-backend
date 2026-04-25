@@ -5,6 +5,7 @@ import PyPDF2
 import docx
 from pptx import Presentation
 import openpyxl
+import re
 
 load_dotenv()
 
@@ -13,7 +14,7 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1"
 )
 
-# ── Text Extractors ──────────────────────────────────────────
+# ── Text Extractors ──────────────────────────────────────────────────────────
 
 def extract_from_pdf(path):
     text = ""
@@ -73,8 +74,6 @@ def extract_from_txt(path):
         print(f"TXT error: {e}")
         return ""
 
-# ── Router ───────────────────────────────────────────────────
-
 def extract_text(path, filename):
     ext = filename.lower().rsplit(".", 1)[-1]
     if ext == "pdf":
@@ -87,29 +86,153 @@ def extract_text(path, filename):
         return extract_from_excel(path)
     elif ext == "txt":
         return extract_from_txt(path)
-    else:
-        return ""
+    return ""
 
-# ── Summarizer ───────────────────────────────────────────────
+# ── Markdown Cleaner ─────────────────────────────────────────────────────────
+# Strips all markdown symbols so the frontend receives plain readable text.
 
-def summarize_text(text, max_tokens=500):
+def clean_markdown(text: str) -> str:
+    # Remove ATX headings (### Title → Title)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Remove bold/italic (**text** / *text* / __text__ / _text_)
+    text = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", text)
+    text = re.sub(r"_{1,3}(.+?)_{1,3}", r"\1", text)
+    # Remove inline code `code`
+    text = re.sub(r"`(.+?)`", r"\1", text)
+    # Remove horizontal rules
+    text = re.sub(r"^[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
+    # Remove blockquotes
+    text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
+    # Collapse 3+ blank lines to 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+# ── Mode Prompts ─────────────────────────────────────────────────────────────
+
+SYSTEM_BASE = (
+    "You are a helpful AI study assistant. "
+    "CRITICAL FORMATTING RULE: Do NOT use any Markdown syntax in your response. "
+    "No hashtags (#), no asterisks (*), no underscores (_), no backticks (`), no hyphens as bullets. "
+    "Write in plain text only. Use numbered lists (1. 2. 3.) where lists are needed. "
+    "Use blank lines to separate sections. Never hallucinate — if information is missing, say so."
+)
+
+MODE_PROMPTS = {
+    "summary": {
+        "system": SYSTEM_BASE,
+        "user": (
+            "Read the following document and write a clear, well-structured summary. "
+            "Structure your response exactly like this:\n\n"
+            "Overview\n"
+            "Write 2-3 sentences giving a high-level overview of what the document is about.\n\n"
+            "Main Points\n"
+            "1. First main point\n"
+            "2. Second main point\n"
+            "3. (continue as needed)\n\n"
+            "Conclusion\n"
+            "1-2 sentences on the overall takeaway or conclusion of the document.\n\n"
+            "Document:\n{text}"
+        ),
+    },
+
+    "keypoints": {
+        "system": SYSTEM_BASE,
+        "user": (
+            "Extract the key points from the following document. "
+            "Return ONLY a numbered list of the most important ideas, facts, or arguments. "
+            "Each point should be one clear sentence. Aim for 5 to 10 points. "
+            "Do not add any headers or extra commentary — just the numbered list.\n\n"
+            "Document:\n{text}"
+        ),
+    },
+
+    "flashcards": {
+        "system": SYSTEM_BASE,
+        "user": (
+            "Create 6 to 10 study flashcards from the following document. "
+            "Each flashcard must follow this EXACT format with no variation:\n\n"
+            "Q: [Question here]\n"
+            "A: [Answer here]\n\n"
+            "Q: [Question here]\n"
+            "A: [Answer here]\n\n"
+            "Rules:\n"
+            "- Each Q/A pair must be separated by a blank line\n"
+            "- Questions should test understanding, not just recall\n"
+            "- Answers should be concise (1-2 sentences)\n"
+            "- Do not number the cards, do not add headers\n\n"
+            "Document:\n{text}"
+        ),
+    },
+
+    "quiz": {
+        "system": SYSTEM_BASE,
+        "user": (
+            "Create a multiple-choice quiz with 5 questions based on the following document. "
+            "Each question must follow this EXACT format with no variation:\n\n"
+            "Q1. [Question text]\n"
+            "A) [Option]\n"
+            "B) [Option]\n"
+            "C) [Option]\n"
+            "D) [Option]\n"
+            "Answer: [Correct letter]\n\n"
+            "Q2. [Question text]\n"
+            "...\n\n"
+            "Rules:\n"
+            "- Number questions Q1 through Q5\n"
+            "- Always include exactly 4 options A B C D\n"
+            "- Always end each question block with 'Answer: X'\n"
+            "- Do not add explanations or any other text\n\n"
+            "Document:\n{text}"
+        ),
+    },
+
+    "chat": {
+        "system": (
+            "You are a helpful AI assistant answering questions about a specific document. "
+            "Answer only based on the document content provided. "
+            "If the answer is not in the document, say 'That information is not in the document.' "
+            "CRITICAL FORMATTING RULE: Do NOT use any Markdown syntax. "
+            "No hashtags, asterisks, underscores, or backticks. Plain text only. "
+            "Keep answers clear and concise."
+        ),
+        "user": (
+            "Document content:\n{text}\n\n"
+            "User question: {question}"
+        ),
+    },
+}
+
+# ── Main Summarizer ──────────────────────────────────────────────────────────
+
+def summarize_text(text: str, mode: str = "summary", question: str = "", max_tokens: int = 1200) -> str:
+    """
+    Generate AI output for the given mode.
+
+    Modes: summary | keypoints | flashcards | quiz | chat
+    """
+    mode = mode if mode in MODE_PROMPTS else "summary"
+    prompt_config = MODE_PROMPTS[mode]
+
+    # Build the user message
+    user_content = prompt_config["user"].format(
+        text=text[:10000],   # cap to stay within token limits
+        question=question,
+    )
+
     try:
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that summarizes documents concisely and clearly."
-                },
-                {
-                    "role": "user",
-                    "content": f"Please summarize the following document content:\n\n{text[:6000]}"
-                }
+                {"role": "system", "content": prompt_config["system"]},
+                {"role": "user",   "content": user_content},
             ],
             max_tokens=max_tokens,
-            temperature=0.5
+            temperature=0.2,
         )
-        return response.choices[0].message.content
+        raw = response.choices[0].message.content or ""
+        # Run the cleaner as a safety net even though we instruct plain text
+        return clean_markdown(raw)
+
     except Exception as e:
         print(f"AI error: {e}")
-        return "Error summarizing document."
+        return "Error generating output. Please try again."
