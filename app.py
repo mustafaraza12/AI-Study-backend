@@ -16,10 +16,11 @@ from routes.auth import auth_bp
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from routes.assignmentmaker import write_assignment
-from routes.Letter import generate_letter,DOC_LABELS
+from routes.Letter import generate_letter, DOC_LABELS
 import traceback
 from routes.Iq import generate_questions, evaluate_answers
 import logging
+import json  # ✅ FIXED: was missing, needed for json.JSONDecodeError
 
 import os
 import tempfile
@@ -47,12 +48,17 @@ limiter = Limiter(
     storage_uri="memory://"
 )
 
-db_url = os.getenv('DATABASE_URL')
-
-if db_url and db_url.startswith("postgres://"):
+# ✅ FIXED: Use Railway's DATABASE_URL env variable, fallback to SQLite for local dev
+db_url = os.getenv('DATABASE_URL', '')
+if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:Mustafa679/@localhost/studify_db'
+if db_url:
+    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
+else:
+    # SQLite fallback for local development (no MySQL needed)
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///studify.db'
+
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # ✅ 4. Apply limits last — after blueprint is registered
@@ -95,7 +101,6 @@ def extract_text_from_pdf(file_path):
     return slides_text
 
 def extract_doc_text(file_path, filename):
-    """Extract plain text from any supported document type."""
     ext = filename.lower().rsplit(".", 1)[-1]
     text = ""
 
@@ -135,6 +140,12 @@ def extract_doc_text(file_path, filename):
 
     return text
 
+# ── Health check / root route ────────────────────────────────
+
+@app.route("/")
+def root():
+    return jsonify({"status": "running", "service": "Studify API"})
+
 # ── Existing Routes ──────────────────────────────────────────
 
 @app.route("/solve-assignment", methods=["POST"])
@@ -152,7 +163,6 @@ def solve():
         return jsonify({"error": "Server error"}), 500
 
 
-# Kept for backward compatibility
 @app.route("/summarize-pdf", methods=["POST"])
 def summarize_pdf():
     try:
@@ -183,152 +193,137 @@ def summarize_pdf():
 @limiter.limit("15 per hour")
 def summarize_document():
     try:
-        # ── 1. Validate file ────────────────────────────────────────────
         if "file" not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
- 
+
         file = request.files["file"]
         if not file.filename:
             return jsonify({"error": "No file selected"}), 400
- 
+
         if not allowed_doc_file(file.filename):
             return jsonify({"error": "Unsupported file type"}), 400
- 
-        # ── 2. Read mode + optional chat question from form data ────────
+
         mode     = request.form.get("mode", "summary").strip().lower()
-        question = request.form.get("question", "").strip()   # only used in chat mode
-        context  = request.form.get("context", "").strip()    # optional cached summary
- 
+        question = request.form.get("question", "").strip()
+        context  = request.form.get("context", "").strip()
+
         VALID_MODES = {"summary", "keypoints", "flashcards", "quiz", "chat"}
         if mode not in VALID_MODES:
             mode = "summary"
- 
-        # Chat mode requires a question
+
         if mode == "chat" and not question:
             return jsonify({"error": "Please enter a question to ask about your document."}), 400
- 
-        # ── 3. Save to temp file ────────────────────────────────────────
+
         ext = file.filename.rsplit(".", 1)[1].lower()
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
             file.save(tmp.name)
             tmp_path = tmp.name
- 
+
         try:
-            # ── 4. Extract text ─────────────────────────────────────────
             text = extract_text(tmp_path, file.filename)
- 
+
             if not text.strip():
                 return jsonify({"error": "Could not extract text from this document."}), 422
- 
-            # ── 5. For chat: prepend cached summary as extra context ────
-            # This means the user doesn't need to re-upload the whole file
-            # for every follow-up question.
+
             if mode == "chat" and context:
                 text = f"[Document Summary for context]\n{context}\n\n[Full Document Text]\n{text}"
- 
-            # ── 6. Generate output ──────────────────────────────────────
+
             result = summarize_text(
                 text=text,
                 mode=mode,
                 question=question,
                 max_tokens=1400,
             )
- 
+
             return jsonify({"summary": result})
- 
+
         finally:
-            # Always clean up the temp file
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
- 
+
     except Exception as e:
         print("SERVER ERROR (summarize_document):", e)
         return jsonify({"error": "Server error. Please try again."}), 500
 
 
- 
 @app.route("/generate-quiz", methods=["POST"])
 @limiter.limit("15 per hour")
 def generate_quiz_route():
     try:
         data = request.json
- 
+
         text         = data.get("text", "").strip()
         num_question = int(data.get("num_question", 10))
         difficulty   = data.get("difficulty", "medium").strip().lower()
         quiz_type    = data.get("quiz_type", "mcq").strip().lower()
- 
-        # ── Validate inputs ──────────────────────────────────────────────────
+
         if not text:
             return jsonify({"error": "No topic provided"}), 400
- 
+
         if num_question < 1 or num_question > 50:
             return jsonify({"error": "num_question must be between 1 and 50"}), 400
- 
+
         if difficulty not in ("easy", "medium", "hard"):
             difficulty = "medium"
- 
+
         if quiz_type not in ("mcq", "truefalse", "mixed"):
             quiz_type = "mcq"
- 
-        # ── Generate ─────────────────────────────────────────────────────────
+
         quiz = generate_quiz(
             text=text,
             num_question=num_question,
             difficulty=difficulty,
             quiz_type=quiz_type,
         )
- 
+
         if not quiz:
             return jsonify({"error": "Could not generate quiz. Try a different topic."}), 400
- 
+
         return jsonify({"quiz": quiz})
- 
+
     except Exception as e:
         print("SERVER ERROR (generate_quiz_route):", e)
         return jsonify({"error": "Server error"}), 500
 
 
 VALID_EXPLAIN_MODES = {"beginner", "detailed", "summary", "linebyline"}
- 
+
 SUPPORTED_LANGUAGES = {
     "python", "javascript", "typescript", "java", "c", "c++", "c#",
     "go", "rust", "php", "ruby", "swift", "kotlin", "sql",
     "html/css", "bash", "dart", "r", "matlab",
 }
- 
- 
+
+
 @app.route("/explain-code", methods=["POST"])
 @limiter.limit("20 per hour")
 def explain_code_route():
     data = request.json
- 
+
     if not data:
         return jsonify({"error": "No data provided"}), 400
- 
+
     code = data.get("code", "").strip()
     language = data.get("language", None)
     mode = data.get("mode", "detailed").strip().lower()
- 
+
     if not code:
         return jsonify({"error": "No code provided"}), 400
- 
+
     if len(code) > 8000:
         return jsonify({"error": "Code too long. Please limit to 8000 characters."}), 400
- 
-    # Validate language
+
     if language and language.lower() not in SUPPORTED_LANGUAGES:
-        language = None  # fallback to auto-detect
- 
-    # Validate mode
+        language = None
+
     if mode not in VALID_EXPLAIN_MODES:
         mode = "detailed"
- 
+
     result = explain_code(code, language=language, mode=mode)
- 
+
     if result == "Error explaining code":
         return jsonify({"error": "Failed to explain code. Please try again."}), 500
- 
+
     return jsonify({"explanation": result})
 
 
@@ -368,34 +363,34 @@ def slide_explainer():
 
 
 VALID_MODES = {"standard", "fluency", "formal", "simple", "creative"}
- 
+
 @app.route("/humanize-text", methods=["POST"])
 @limiter.limit("20 per hour")
 def humanize():
     data = request.json
- 
+
     if not data:
         return jsonify({"error": "No data provided"}), 400
- 
+
     text = data.get("text", "").strip()
     mode = data.get("mode", "standard").strip().lower()
- 
+
     if not text:
         return jsonify({"error": "No text provided"}), 400
- 
+
     if len(text) > 5000:
         return jsonify({"error": "Text too long. Please limit to 5000 characters."}), 400
- 
+
     if mode not in VALID_MODES:
         mode = "standard"
- 
+
     result = humanize_text(text, mode)
- 
+
     if result == "Error humanizing text":
         return jsonify({"error": "Failed to humanize text. Please try again."}), 500
- 
+
     return jsonify({"humanized": result})
- 
+
 @app.route("/youtube-transcript", methods=["POST"])
 @limiter.limit("30 per hour")
 def youtube_transcript():
@@ -415,7 +410,6 @@ def youtube_transcript():
         return jsonify({"error": "Server error"}), 500
 
 
-# Slow route — LLM analysis, returns in 8-15s
 @app.route("/analyze-youtube", methods=["POST"])
 @limiter.limit("10 per hour")
 def youtube_analyze():
@@ -438,38 +432,26 @@ def youtube_analyze():
 @app.route("/solve-math", methods=["POST"])
 @limiter.limit("20 per hour")
 def math_solver():
-    """
-    Accepts EITHER:
-      A) JSON body  { "problem": "2x + 5 = 11" }
-      B) multipart form with:
-           - optional "image" file  → OCR'd to text
-           - optional "problem" text field
-         If both are provided, the extracted OCR text is APPENDED to the
-         typed problem so the AI sees everything at once.
-    """
     try:
         problem_text = ""
         extracted_ocr = ""
- 
+
         content_type = request.content_type or ""
- 
-        # ── A: plain JSON ────────────────────────────────────────────────
+
         if "application/json" in content_type:
             data = request.get_json(force=True) or {}
             problem_text = str(data.get("problem", "")).strip()
- 
-        # ── B: multipart form (image + optional text) ────────────────────
+
         else:
             problem_text = str(request.form.get("problem", "")).strip()
- 
+
             if "image" in request.files:
                 img_file = request.files["image"]
                 if img_file and img_file.filename:
                     from routes.math import extract_text_from_image
                     img_file.seek(0)
                     extracted_ocr = extract_text_from_image(img_file).strip()
- 
-        # ── Combine typed text + OCR text ────────────────────────────────
+
         combined = ""
         if problem_text and extracted_ocr:
             combined = f"{problem_text}\n\nProblems from image:\n{extracted_ocr}"
@@ -477,41 +459,37 @@ def math_solver():
             combined = problem_text
         elif extracted_ocr:
             combined = extracted_ocr
- 
+
         if not combined:
             return jsonify({
                 "error": "Please provide a math problem as text or upload an image."
             }), 400
- 
+
         result = solve_math(combined)
- 
+
         if result["success"]:
             response_body = {"data": result["data"]}
             if extracted_ocr:
-                response_body["extracted_text"] = extracted_ocr   # show user what was read
+                response_body["extracted_text"] = extracted_ocr
             return jsonify(response_body)
         else:
             return jsonify({"error": result.get("error", "Unknown error")}), 500
- 
+
     except Exception as e:
         print("Math Solver Error:", e)
         return jsonify({"error": "Server error"}), 500
- 
- 
+
+
 @app.route("/solve-math-image", methods=["POST"])
 @limiter.limit("20 per hour")
 def math_solver_image():
-    """
-    Legacy image-only endpoint — kept for backward compatibility.
-    Prefer /solve-math with a multipart form now.
-    """
     try:
         if "image" not in request.files:
             return jsonify({"error": "No image provided"}), 400
- 
+
         file = request.files["image"]
         result = solve_math_image(file)
- 
+
         if result["success"]:
             return jsonify({
                 "data": result["data"],
@@ -519,11 +497,11 @@ def math_solver_image():
             })
         else:
             return jsonify({"error": result.get("error", "Unknown error")}), 500
- 
+
     except Exception as e:
         print("Math Image Solver Error:", e)
         return jsonify({"error": "Server error"}), 500
-    
+
 
 @app.route("/write-essay", methods=["POST"])
 @limiter.limit("10 per hour")
@@ -545,7 +523,7 @@ def essay_writer():
     except Exception as e:
         print("Essay Writer Error:", e)
         return jsonify({"error": "Server error"}), 500
-    
+
 @app.route("/generate-flashcards", methods=["POST"])
 @limiter.limit("15 per hour")
 def flashcard_generator():
@@ -599,49 +577,26 @@ def flashcard_generator_file():
 
 @app.route("/api/assignment", methods=["POST"])
 def generate_assignment():
-    """
-    POST /api/assignment
-    Body (JSON):
-    {
-        "topic"        : "The Impact of Climate Change on Agriculture",
-        "pages"        : 3,
-        "subject"      : "Environmental Science",
-        "student_name" : "Ali Hassan",
-        "roll_no"      : "CS-2024-045",
-        "professor"    : "Dr. Ahmed Khan",
-        "humanize"     : true
-    }
- 
-    Response (JSON):
-    {
-        "success" : true,
-        "content" : "<full assignment body text>"
-    }
-    """
     try:
         data = request.get_json()
- 
+
         if not data:
             return jsonify({"success": False, "error": "No JSON body provided."}), 400
- 
-        # ── Required field ───────────────────────────────────────────────────
+
         topic = data.get("topic", "").strip()
         if not topic:
             return jsonify({"success": False, "error": "Assignment topic is required."}), 400
- 
-        # ── Optional fields with sensible defaults ───────────────────────────
+
         pages        = int(data.get("pages", 3))
         subject      = data.get("subject", topic).strip()
         student_name = data.get("student_name", "Student Name").strip()
         roll_no      = data.get("roll_no", "N/A").strip()
         professor    = data.get("professor", "Professor").strip()
         humanize     = bool(data.get("humanize", True))
- 
-        # ── Validate pages range ─────────────────────────────────────────────
+
         if pages < 1 or pages > 10:
             return jsonify({"success": False, "error": "Pages must be between 1 and 10."}), 400
- 
-        # ── Generate ─────────────────────────────────────────────────────────
+
         content = write_assignment(
             topic        = topic,
             pages        = pages,
@@ -651,44 +606,36 @@ def generate_assignment():
             professor    = professor,
             humanize     = humanize,
         )
- 
+
         if content.startswith("Error generating assignment:"):
             return jsonify({"success": False, "error": content}), 500
- 
+
         return jsonify({"success": True, "content": content})
- 
+
     except ValueError as ve:
         return jsonify({"success": False, "error": f"Invalid input: {str(ve)}"}), 400
     except Exception as e:
         print(f"[/api/assignment] Unexpected error: {e}")
         return jsonify({"success": False, "error": "An unexpected error occurred."}), 500
- 
 
- 
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "IQ Test API"})
- 
- 
-# ── Generate questions ─────────────────────────────────────────────────────
+
+
 @app.route("/api/iq/generate", methods=["POST"])
 def api_generate():
-    """
-    POST /api/iq/generate
-    Body: { name, age, education, subject?, grade?, count? }
-    Returns: { success, questions, time_per_question }
-    """
     try:
         body = request.get_json(force=True)
- 
+
         name      = str(body.get("name",      "")).strip()
         age       = int(body.get("age",        0))
         education = str(body.get("education", "")).strip()
         subject   = str(body.get("subject",   "")).strip()
         grade     = str(body.get("grade",     "")).strip()
         count     = int(body.get("count",      15))
- 
-        # Validation
+
         if not name:
             return jsonify({"success": False, "error": "Name is required"}), 400
         if age < 5 or age > 100:
@@ -697,37 +644,30 @@ def api_generate():
             return jsonify({"success": False, "error": "Education level is required"}), 400
         if count < 5 or count > 30:
             return jsonify({"success": False, "error": "Count must be between 5 and 30"}), 400
- 
+
         questions, time_per_q = generate_questions(
             name=name, age=age, education=education,
             subject=subject, grade=grade, count=count,
         )
- 
+
         return jsonify({
             "success":           True,
             "questions":         questions,
             "time_per_question": time_per_q,
         })
- 
+
     except json.JSONDecodeError as e:
         return jsonify({"success": False, "error": f"AI returned invalid JSON: {str(e)}"}), 500
     except Exception as e:
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
- 
- 
-# ── Evaluate answers ───────────────────────────────────────────────────────
+
+
 @app.route("/api/iq/evaluate", methods=["POST"])
 def api_evaluate():
-    """
-    POST /api/iq/evaluate
-    Body: { name, age, education, subject?, grade?, questions, answers, timed_out, time_taken }
-    Returns: { success, result: { iq_score, percentile, correct, accuracy, time_taken,
-                                  breakdown, analysis, strengths, improvements } }
-    """
     try:
         body = request.get_json(force=True)
- 
+
         name       = str(body.get("name",      "")).strip()
         age        = int(body.get("age",        0))
         education  = str(body.get("education", "")).strip()
@@ -737,92 +677,87 @@ def api_evaluate():
         answers    = body.get("answers",    {})
         timed_out  = bool(body.get("timed_out",  False))
         time_taken = int(body.get("time_taken",  0))
- 
+
         if not questions:
             return jsonify({"success": False, "error": "No questions provided"}), 400
- 
+
         result = evaluate_answers(
             name=name, age=age, education=education,
             subject=subject, grade=grade,
             questions=questions, answers=answers,
             timed_out=timed_out, time_taken=time_taken,
         )
- 
+
         return jsonify({"success": True, "result": result})
- 
+
     except json.JSONDecodeError as e:
         return jsonify({"success": False, "error": f"AI returned invalid JSON: {str(e)}"}), 500
     except Exception as e:
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
-    
 
- 
- 
+
 @app.route("/api/letter", methods=["POST"])
 @limiter.limit("15 per hour")
 def api_letter():
     try:
         body = request.get_json(force=True)
- 
+
         doc_type        = str(body.get("doc_type",         "")).strip()
         tone            = str(body.get("tone",        "formal")).strip().lower()
         subject         = str(body.get("subject",          "")).strip()
         sender_name     = str(body.get("sender_name",      "")).strip()
-        sender_class    = str(body.get("sender_class",     "")).strip()   # ✅ was missing
+        sender_class    = str(body.get("sender_class",     "")).strip()
         recipient_title = str(body.get("recipient_title",  "")).strip()
         recipient_org   = str(body.get("recipient_org",    "")).strip()
         recipient_addr  = str(body.get("recipient_addr",   "")).strip()
         extra_details   = str(body.get("extra_details",    "")).strip()
-        date            = str(body.get("date",             "")).strip()   # ✅ was missing
- 
-        # ── Validation ─────────────────────────────────────────────────────
+        date            = str(body.get("date",             "")).strip()
+
         if not doc_type:
             return jsonify({"success": False, "error": "doc_type is required"}), 400
- 
+
         if doc_type not in DOC_LABELS:
             return jsonify({
                 "success": False,
                 "error": f"Unknown doc_type '{doc_type}'.",
             }), 400
- 
+
         if not subject:
             return jsonify({"success": False, "error": "subject is required"}), 400
- 
+
         if not recipient_title:
             return jsonify({"success": False, "error": "recipient_title is required"}), 400
- 
+
         valid_tones = {"formal", "polite", "humble", "urgent"}
         if tone not in valid_tones:
             tone = "formal"
- 
-        # ── Generate ───────────────────────────────────────────────────────
+
         content = generate_letter(
             doc_type=doc_type,
             tone=tone,
             subject=subject,
             sender_name=sender_name,
-            sender_class=sender_class,       # ✅ correct param name
+            sender_class=sender_class,
             recipient_title=recipient_title,
             recipient_org=recipient_org,
             recipient_addr=recipient_addr,
             extra_details=extra_details,
-            date=date,                       # ✅ correct param name
+            date=date,
         )
- 
+
         return jsonify({"success": True, "content": content})
- 
+
     except Exception as e:
-        import traceback
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
- 
+
 
 db = SQLAlchemy(app)
-    
+
 
 class Post(db.Model):
-    __tablename__ = 'Studify' # Tells Flask to look for the 'posts' table
+    __tablename__ = 'Studify'
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(255), nullable=False)
     slug = db.Column(db.String(255), unique=True, nullable=False)
@@ -830,12 +765,11 @@ class Post(db.Model):
     image_url = db.Column(db.String(500))
     category = db.Column(db.String(50))
 
-# 3. THE ROUTE (The "Slug" logic you mentioned)
+
 @app.route('/api/news/<string:post_slug>', methods=['GET'])
 def get_post(post_slug):
-    # This searches the DB for a post where the slug matches the URL
     post = Post.query.filter_by(slug=post_slug).first()
-    
+
     if post:
         return jsonify({
             "title": post.title,
@@ -845,8 +779,8 @@ def get_post(post_slug):
         }), 200
     else:
         return jsonify({"message": "Post not found"}), 404
- 
- 
 
+
+# ✅ FIXED: host="0.0.0.0" is required for Railway
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
