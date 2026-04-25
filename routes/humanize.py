@@ -70,4 +70,3 @@ def humanize_text(text: str, mode: str = DEFAULT_MODE) -> str:
     except Exception as e:
         print(f"Humanizer Error [{mode}]:", e)
         return "Error humanizing text"", e)
-        return "Error humanizing text"
